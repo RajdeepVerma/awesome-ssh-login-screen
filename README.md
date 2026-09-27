@@ -2,8 +2,14 @@
 
 A fastfetch / btop-style **SSH login screen** for Ubuntu servers — system info, live CPU/RAM/network, Docker stacks, and security status, shown every time you SSH in.
 
-```
+<p align="center">
+  <img src="assets/screenshot.png" alt="awesome-server-motd login screen" width="700">
+</p>
 
+<details>
+<summary>Plain-text preview</summary>
+
+```
 ╭─ web ─────────────────────────────────────────────────────────┤ 10.0.0.12 ├──╮
 │                                   OS       Ubuntu 24.04.1 LTS aarch64        │
 │                    .ooo.          Host     KVM Virtual Machine               │
@@ -44,7 +50,8 @@ A fastfetch / btop-style **SSH login screen** for Ubuntu servers — system info
 
   Last login: Sun Sep 27 09:30:49 2026 from 10.0.0.12
 ```
-<sub>(rendered in true color — orange logo, green→yellow→red meters, colored status dots)</sub>
+
+</details>
 
 ## Features
 
