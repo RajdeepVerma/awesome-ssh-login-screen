@@ -172,4 +172,4 @@ Preview without logging in: `bash /usr/local/share/awesome-ssh-login-screen/dash
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Distro logo art in `logos.txt` is from [fastfetch](https://github.com/fastfetch-cli/fastfetch), MIT — see [LICENSE-fastfetch](LICENSE-fastfetch).
+MIT — see [LICENSE](LICENSE). Distro logo art in `logos.txt` is from [fastfetch](https://github.com/fastfetch-cli/fastfetch) (MIT; its notice is at the top of that file).
