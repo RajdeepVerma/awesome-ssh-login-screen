@@ -1,0 +1,252 @@
+#!/bin/bash
+# SSH login dashboard — fastfetch-style header + btop-style panels.
+# Run by pam_motd (update-motd) on every SSH login.
+# Rendered into a buffer and written in ONE write at the end (no flicker).
+# Helpers write into variables (printf -v) instead of $(...) to avoid forks — keeps login fast.
+# Nothing blocks on the network; the public IP is cached and refreshed in the background.
+
+export LC_ALL=C.UTF-8
+
+CACHE_DIR=/var/cache/motd-dashboard
+mkdir -p "$CACHE_DIR" 2>/dev/null
+
+# ── palette (catppuccin-ish) ─────────────────────────────────────────────
+R=$'\e[0m' B=$'\e[1m'
+FG=$'\e[38;2;205;214;244m'   # text
+MU=$'\e[38;2;127;132;156m'   # muted
+BD=$'\e[38;2;88;91;112m'     # borders / empty meter
+AC=$'\e[38;2;137;180;250m'   # accent
+OR=$'\e[38;2;250;150;90m'    # ubuntu orange
+GR=$'\e[38;2;166;227;161m' YE=$'\e[38;2;249;226;175m' RD=$'\e[38;2;243;139;168m'
+
+W=80            # total width
+IW=$((W - 4))   # inner width of a panel
+OUT=""
+emit() { OUT+="$1"$'\n'; }
+vlen() {                                    # visible length, ANSI stripped -> VL
+  local x=$1 pre rest                       # (loop is ~30x faster than an extglob ${//})
+  while [[ $x == *$'\e['* ]]; do pre=${x%%$'\e['*}; rest=${x#*$'\e['}; x=$pre${rest#*m}; done
+  VL=${#x}
+}
+rep() { local s; printf -v s "%*s" "$2" ""; REP="${s// /$1}"; }      # -> REP
+fit() { local s=$1; ((${#s} > $2)) && s="${s:0:$2-1}…"; printf -v FIT "%-$2s" "$s"; }  # -> FIT
+human() {                                                           # bytes -> HUM
+  local v=$1 u=(B K M G T P) i=0
+  while ((v >= 10240 && i < 5)); do v=$((v / 1024)); i=$((i + 1)); done
+  if ((v >= 1024)); then HUM="$((v / 1024)).$((v % 1024 * 10 / 1024))${u[i + 1]}"; else HUM="${v}${u[i]}"; fi
+}
+
+panel_top() { # panel_top "title" ["right text"]
+  local t=" ${B}${AC}$1${R}${BD} " rt="" tl rl
+  [ -n "$2" ] && rt="${BD}┤${R} $2 ${BD}├"
+  vlen "$t"; tl=$VL; vlen "$rt"; rl=$VL
+  rep ─ $((W - 4 - tl - rl))
+  emit "${BD}╭─${t}${REP}${rt}─╮${R}"
+}
+panel_row() { vlen "$1"; local pad=$((IW - VL)); ((pad < 0)) && pad=0; emit "${BD}│${R} $1$(printf '%*s' $pad '') ${BD}│${R}"; }
+panel_bot() { rep ─ $((W - 2)); emit "${BD}╰${REP}╯${R}"; }
+
+# btop-style meter: green → yellow → red by position   -> MET
+meter() {
+  local p=$1 n=$2 f i c last="" s=""
+  ((p > 100)) && p=100; f=$(((p * n + 50) / 100))
+  for ((i = 0; i < f; i++)); do
+    if ((i * 100 / n >= 85)); then c=$RD; elif ((i * 100 / n >= 60)); then c=$YE; else c=$GR; fi
+    [ "$c" != "$last" ] && s+="$c" && last=$c
+    s+='■'
+  done
+  rep '■' $((n - f)); MET="${s}${BD}${REP}${R}"
+}
+
+# ── first snapshot for cpu % / net speed (second one is taken at the resources panel) ──
+read -r _ _ _ _ IFACE _ < <(ip -4 -o route show default 2>/dev/null)
+snap() {
+  local c u n s i io irq sirq st
+  read -r c u n s i io irq sirq st _ </proc/stat
+  CTOT=$((u + n + s + i + io + irq + sirq + st)); CIDLE=$((i + io))
+  RX=0 TX=0
+  [ -n "$IFACE" ] && while read -r ifn rx _ _ _ _ _ _ _ tx _; do [ "$ifn" = "$IFACE:" ] && { RX=$rx TX=$tx; break; }; done </proc/net/dev
+}
+snap; CTOT0=$CTOT CIDLE0=$CIDLE RX0=$RX TX0=$TX T0=${EPOCHREALTIME/./}
+
+# ── gather ───────────────────────────────────────────────────────────────
+. /etc/os-release
+HOST=${HOSTNAME%%.*}
+read -r _ _ KERNEL _ < /proc/version
+ARCH=$(uname -m)
+read -r up _ </proc/uptime; up=${up%.*}
+UPTIME="$((up / 86400))d $((up % 86400 / 3600))h $((up % 3600 / 60))m"
+CORES=$(nproc)
+CPU=$(lscpu 2>/dev/null | awk -F: '/Model name/{gsub(/^ +/,"",$2); print $2; exit}')
+read -r VIRT </sys/class/dmi/id/product_name 2>/dev/null
+PKGS=$(dpkg-query -f '.\n' -W 2>/dev/null | wc -l)
+PROCS=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l)
+SESS=$(who 2>/dev/null | wc -l)
+read -r _ _ _ _ _ _ LAN _ < <(ip -4 -o route get 1.1.1.1 2>/dev/null)
+pubf=$CACHE_DIR/public_ip
+if [ -z "$(find "$pubf" -mmin -60 2>/dev/null)" ]; then
+  (curl -4 -fsS -m 3 https://ifconfig.me >"$pubf.tmp" 2>/dev/null && mv "$pubf.tmp" "$pubf") >/dev/null 2>&1 &
+fi
+PUB=""; [ -r "$pubf" ] && read -r PUB <"$pubf"
+HAVE_DOCKER=0
+if command -v docker >/dev/null && DPS=$(docker ps -a --format '{{.Label "com.docker.compose.project"}}|{{.Names}}|{{.Image}}|{{.State}}|{{.Status}}|{{.Ports}}|{{.Networks}}' 2>/dev/null); then
+  HAVE_DOCKER=1
+  DVER=$(docker version -f '{{.Server.Version}}' 2>/dev/null)
+fi
+
+# ── header (fastfetch style: logo left, info right) ──────────────────────
+logo=(   # Ubuntu circle of friends, compact ASCII
+  "             .ooo."
+  "      .:looo looo:"
+  "    .looo''   ''"
+  "    'ol'       :oo."
+  ".ooo.           ooo"
+  "'ooo'           ooo"
+  "    .ol.       :oo'"
+  "    'looo..   .."
+  "      ':looo looo:"
+  "             'ooo'"
+)
+k() { printf -v KV "${AC}${B}%-9s${R}${FG}%s${R}" "$1" "$2"; }
+info=()
+k OS "$PRETTY_NAME $ARCH";            info+=("$KV")
+k Host "${VIRT:-unknown}";            info+=("$KV")
+k Kernel "$KERNEL";                   info+=("$KV")
+k Uptime "$UPTIME";                   info+=("$KV")
+k Packages "$PKGS (dpkg)";            info+=("$KV")
+k Users "$(who 2>/dev/null | awk '{print $1}' | sort -u | xargs)";  info+=("$KV")
+k CPU "$CPU × $CORES";                info+=("$KV")
+k Procs "$PROCS  ·  $SESS ssh sessions";  info+=("$KV")
+k Public "${PUB:-${MU}resolving…}";   info+=("$KV")
+k Docker "${DVER:-n/a}";              info+=("$KV")
+k Time "$(date '+%a %d %b, %H:%M %Z')"; info+=("$KV")
+p1="" p2=""; for c in 0 1 2 3 4 5 6 7; do p1+=$'\e'"[4${c}m   "; p2+=$'\e'"[10${c}m   "; done
+printf -v KV "%-9s%s" "" "${p1}${R}"; info+=("$KV")      # normal colors
+printf -v KV "%-9s%s" "" "${p2}${R}"; info+=("$KV")      # bright colors
+
+# same panel style as below: hostname in the title bar, logo + info inside
+emit ""
+panel_top "$HOST" "${FG}${LAN}${R}"
+rows=$(( ${#info[@]} > ${#logo[@]} ? ${#info[@]} : ${#logo[@]} ))
+off=$(( (rows - ${#logo[@]}) / 2 ))
+for ((i = 0; i < rows; i++)); do
+  l=""; ((i >= off)) && l=${logo[i - off]:-}
+  printf -v pad "%*s" $((28 - ${#l})) ""   # pad by characters (printf %-Ns counts bytes)
+  panel_row "      ${OR}${l}${pad}${R}${info[i]}"
+done
+panel_bot
+
+# ── resources panel ─────────────────────────────────────────────────────
+# cpu % and net speed = difference between the snapshot taken at the top and now (~0.2s window)
+snap
+while (( $(( ${EPOCHREALTIME/./} - T0 )) < 200000 )); do sleep 0.05; snap; done
+snap; dt=$(( ${EPOCHREALTIME/./} - T0 ))                      # µs
+cpu_pct=$(( (CTOT - CTOT0) > 0 ? 100 * ((CTOT - CTOT0) - (CIDLE - CIDLE0)) / (CTOT - CTOT0) : 0 ))
+rx_s=$(( (RX - RX0) * 1000000 / dt )); tx_s=$(( (TX - TX0) * 1000000 / dt ))
+emit ""
+panel_top "resources"
+row() { meter "$2" 36; printf -v RW "${FG}%-4s${R} %s ${FG}${B}%3d%%${R}  ${MU}%s${R}" "$1" "$MET" "$2" "$3"; panel_row "$RW"; }
+row "cpu" "$cpu_pct" "of $CORES cores"
+while read -r key val _; do case $key in MemTotal:) mt=$val ;; MemAvailable:) ma=$val ;; esac; done </proc/meminfo
+human $(((mt - ma) * 1024)); a=$HUM; human $((mt * 1024))
+row "ram" $(((mt - ma) * 100 / mt)) "$a of $HUM used"
+if [ -n "$IFACE" ]; then
+  human "$rx_s"; a=$HUM; human "$tx_s"; b=$HUM; human "$RX"; c=$HUM; human "$TX"
+  printf -v RW "${FG}%-4s${R} ${GR}↓${R} ${FG}${B}%-8s${R} ${OR}↑${R} ${FG}${B}%-8s${R}  ${MU}total  ↓ %s  ↑ %s${R}" net "$a/s" "$b/s" "$c" "$HUM"
+  panel_row "$RW"
+fi
+panel_bot
+
+# ── docker panel ────────────────────────────────────────────────────────
+if ((HAVE_DOCKER)); then
+  total=0 running=0
+  while IFS='|' read -r _ _ _ state _; do total=$((total + 1)); [ "$state" = running ] && running=$((running + 1)); done <<<"$DPS"
+  stacks=(/opt/stacks/*/); [ -d "${stacks[0]}" ] || stacks=()
+  ((running == total)) && sc=$GR || sc=$YE
+  emit ""
+  sttl=""; ((${#stacks[@]})) && sttl=" · ${#stacks[@]} stacks"
+  panel_top "docker" "${sc}${B}${running}/${total}${R} ${MU}running${sttl}${R}"
+  first=1
+  while read -r proj; do
+    mapfile -t rows < <(awk -F'|' -v p="$proj" '($1==""?"(standalone)":$1)==p' <<<"$DPS" | sort -t'|' -k2,2)
+    n=${#rows[@]} r=0 bad=0
+    for row_ in "${rows[@]}"; do
+      [[ $row_ == *"|running|"* ]] && r=$((r + 1))
+      [[ $row_ == *"|running|"* && $row_ != *unhealthy* ]] || bad=1
+    done
+    ((bad)) && pc=$RD || pc=$GR
+    ((first)) || panel_row ""
+    first=0
+    dir=""; [ -d "/opt/stacks/$proj" ] && dir="/opt/stacks/$proj"
+    fit "$proj" 32; a=$FIT; fit "$dir" 32
+    printf -v RW "${pc}◆${R} ${B}${FG}%s${R} ${MU}%s${R}    ${pc}${B}%5s${R}" "$a" "$FIT" "$r/$n"
+    panel_row "$RW"
+    i=0
+    for row_ in "${rows[@]}"; do
+      IFS='|' read -r _ name image state status ports nets <<<"$row_"
+      i=$((i + 1)); ((i == n)) && br="└─" || br="├─"
+      if [[ $state != running ]]; then dc=$RD; up="$state"
+      elif [[ $status == *unhealthy* ]]; then dc=$RD; up="unhealthy"
+      elif [[ $status == *starting* ]]; then dc=$YE; up="starting"
+      else dc=$GR; up=${status#Up }; up=${up% (*}; up=${up/About an /1 }; up=${up/About a /1 }; up=${up/Less than a second/now}
+        up=${up/ minutes/m}; up=${up/ minute/m}; up=${up/ hours/h}; up=${up/ hour/h}; up=${up/ seconds/s}
+        up=${up/ days/d}; up=${up/ weeks/w}; up=${up/ months/mo}; up=${up/ month/mo}; up=${up/ years/y}; up=${up/ year/y}; fi
+      hc=" "; [[ $status == *"(healthy)"* ]] && hc="${GR}♥${R}"
+      img=$image; [[ ${img%%/*} == *.* && $img == */* ]] && img=${img#*/}   # drop registry host
+      img=${img%:latest}
+      pub=""
+      while [[ $ports =~ 0\.0\.0\.0:([0-9]+)- ]]; do [[ " $pub " == *" :${BASH_REMATCH[1]} "* ]] || pub+="${pub:+ }:${BASH_REMATCH[1]}"; ports=${ports#*"${BASH_REMATCH[0]}"}; done
+      [ -z "$pub" ] && [ "$nets" = host ] && pub="host"
+      fit "$name" 24; a=$FIT; fit "$img" 28; b=$FIT; fit "$pub" 8; c=$FIT
+      printf -v RW " ${BD}%s${R}${dc}●${R}%s${FG}%s${R} ${MU}%s${R} ${AC}%s${R} ${FG}%5s${R}" "$br" "$hc" "$a" "$b" "$c" "$up"
+      panel_row "$RW"
+    done
+  done < <(awk -F'|' '{print ($1==""?"(standalone)":$1)}' <<<"$DPS" | sort -u)
+  panel_bot
+fi
+
+# ── status panel ────────────────────────────────────────────────────────
+emit ""
+panel_top "status"
+st_row() { printf -v RW "${FG}%-9s${R}%s" "$1" "$2"; panel_row "$RW"; }
+# login: sshd logs "Accepted …" before the session (and this script) starts, so the newest
+# entry is this login and the one before it for the same user is the previous login.
+mapfile -t acc < <(cat /var/log/auth.log.1 /var/log/auth.log 2>/dev/null | grep -E 'sshd\[[0-9]+\]: Accepted ' | tail -n 200)
+LASTLINE=""
+if ((${#acc[@]})); then
+  read -r _ _ _ _ _ _ who _ <<<"${acc[-1]}"
+  for ((i = ${#acc[@]} - 2; i >= 0; i--)); do
+    read -r t _ _ _ _ _ u _ f _ <<<"${acc[i]}"
+    if [ "$u" = "$who" ]; then   # same wording as sshd's own line, just colored
+      LASTLINE="  ${MU}Last login:${R} ${FG}$(date -d "${t%%.*}" '+%a %b %e %H:%M:%S %Y')${R} ${MU}from${R} ${AC}${f}${R}"
+      break
+    fi
+  done
+fi
+since=$(date -d '24 hours ago' +%Y-%m-%dT%H:%M)
+read -r fails ips top < <(awk -v d="$since" '$1>=d && /sshd.*(Failed password|Invalid user)/ { if (match($0, /from [0-9a-f.:]+/)) { n++; c[substr($0, RSTART+5, RLENGTH-5)]++ } }
+  END{m=0; for(i in c){u++; if(c[i]>m){m=c[i]; t=i}} printf "%d %d %s\n", n, u, t}' /var/log/auth.log 2>/dev/null)
+if ((${fails:-0} > 0)); then
+  st_row ssh "${YE}▲ ${fails} failed logins${R} ${MU}from ${ips} IPs in 24h · top ${top}${R}"
+else
+  st_row ssh "${GR}✔ no failed logins in 24h${R}"
+fi
+systemctl is-active -q fail2ban 2>/dev/null && st_row fail2ban "${GR}✔ active${R}"
+upd=/var/lib/update-notifier/updates-available
+if [ -r "$upd" ]; then
+  n=$(grep -oE '^[0-9]+ updates? can' "$upd" | awk '{print $1}')
+  s=$(grep -oE '^[0-9]+ of these' "$upd" | awk '{print $1}')
+  if ((${n:-0} > 0)); then
+    st_row updates "${YE}▲ ${n} packages${R}${s:+ ${RD}(${s} security)${R}} ${MU}· apt list --upgradable${R}"
+  else
+    st_row updates "${GR}✔ up to date${R}"
+  fi
+fi
+if [ -f /var/run/reboot-required ]; then
+  st_row reboot "${RD}${B}✖ required${R} ${MU}$(sort -u /var/run/reboot-required.pkgs 2>/dev/null | head -3 | xargs)${R}"
+fi
+panel_bot
+emit ""
+
+[ -n "$LASTLINE" ] && emit "$LASTLINE" && emit ""
+printf '%s' "$OUT"
