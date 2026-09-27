@@ -1,0 +1,12 @@
+@ ubuntu
+= 38;2;250;150;90
+             .ooo.
+      .:looo looo:
+    .looo''   ''
+    'ol'       :oo.
+.ooo.           ooo
+'ooo'           ooo
+    .ol.       :oo'
+    'looo..   ..
+      ':looo looo:
+             'ooo'
