@@ -5,7 +5,7 @@ A fastfetch / btop-style **SSH login screen** for Linux servers — your distro'
 Works on Ubuntu, Debian, Fedora, RHEL / Rocky / Alma / Oracle, Amazon Linux, Arch, openSUSE, Alpine and [~200 other distros](logos.txt).
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="Stock Ubuntu SSH login (left) vs awesome-ssh-login-screen (right)" width="100%">
+  <img src="assets/before-after.png" alt="Stock Ubuntu SSH login (left) vs awesome-ssh-login-screen (right)" width="100%">
   <br><sub>Stock Ubuntu login (left) → awesome-ssh-login-screen (right)</sub>
 </p>
 
